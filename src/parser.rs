@@ -21,7 +21,7 @@ impl Parser {
             ":" => Ok(RespType::Int(contents.trim_end().parse::<i64>().unwrap())),
             "$" => Ok(RespType::BulkStr(contents.trim_end().to_owned())),
             "*" => {
-                let (elems, arr_contents) = contents.split_at(1);
+                let (elems, arr_contents) = contents.split_once("\r\n").unwrap();
                 let mut out: Vec<RespType> = Vec::new();
                 let limit = elems.parse::<u32>().unwrap();
                 let mut arr_lines = arr_contents.lines();
