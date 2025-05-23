@@ -1,40 +1,84 @@
-use std::error::Error;
-
 #[derive(Debug, PartialEq)]
-pub enum RespType {
+pub enum Resp {
     SimpStr(String),
     Err(String),
     Int(i64),
     BulkStr(String),
-    Arr(Vec<RespType>),
+    Arr(Vec<Resp>),
 }
 
 pub struct Parser;
 
 impl Parser {
-    pub fn deserialize(data: &str) -> Result<RespType, Box<dyn Error>> {
-        let (resp_type, contents) = data.split_at(1);
+    pub fn deserialize(data: &str) -> Option<Resp> {
+        let mut input = data;
+        Self::parse(&mut input)
+    }
 
-        match resp_type {
-            "+" => Ok(RespType::SimpStr(contents.trim_end().to_owned())),
-            "-" => Ok(RespType::Err(contents.trim_end().to_owned())),
-            ":" => Ok(RespType::Int(contents.trim_end().parse::<i64>().unwrap())),
-            "$" => Ok(RespType::BulkStr(contents.trim_end().to_owned())),
-            "*" => {
-                let (elems, arr_contents) = contents.split_once("\r\n").unwrap();
-                let mut out: Vec<RespType> = Vec::new();
-                let limit = elems.parse::<u32>().unwrap();
-                let mut arr_lines = arr_contents.lines();
+    fn parse(input: &mut &str) -> Option<Resp> {
+        let (prefix, rest) = input.split_at(1);
+        *input = rest;
 
-                for _ in 0..limit {
-                    if let Some(line) = arr_lines.next() {
-                        out.push(Parser::deserialize(line).unwrap());
-                    }
+        match prefix {
+            "+" => Some(Resp::SimpStr(Self::read_line(input)?)),
+            "-" => Some(Resp::Err(Self::read_line(input)?)),
+            ":" => Self::read_line(input)?.parse::<i64>().ok().map(Resp::Int),
+            "$" => {
+                let len_line = Self::read_line(input)?;
+                let len: usize = len_line.parse().ok()?;
+                let (bulk, rest) = input.split_at(len + 2);
+                let (bulk_str, term) = bulk.split_at(len);
+                if term != "\r\n" {
+                    return None;
                 }
-
-                Ok(RespType::Arr(out))
+                *input = rest;
+                Some(Resp::BulkStr(bulk_str.to_owned()))
             }
-            _ => Err("Type not implemented".into())
+            "*" => {
+                let count_line = Self::read_line(input)?;
+                let count: usize = count_line.parse().ok()?;
+                let mut elems = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let elem = Self::parse(input)?;
+                    elems.push(elem);
+                }
+                Some(Resp::Arr(elems))
+            }
+            _ => None,
+        }
+    }
+
+    fn read_line(input: &mut &str) -> Option<String> {
+        if let Some(pos) = input.find("\r\n") {
+            let (line, rest) = input.split_at(pos);
+            *input = &rest[2..];
+            Some(line.to_owned())
+        } else {
+            None
+        }
+    }
+
+    pub fn serialize(data: Resp) -> Option<String> {
+        match data {
+            Resp::SimpStr(str) => Some(format!("+{str}\r\n")),
+            Resp::Err(str) => Some(format!("-{str}\r\n")),
+            Resp::Int(num) => Some(format!(":{num}\r\n")),
+            Resp::BulkStr(str) => Some(format!("${}\r\n{}\r\n", str.len(), str)),
+            Resp::Arr(elems) => {
+                let mut out = String::new();
+                let mut count = 0;
+                for elem in elems {
+                    if let Some(serialized) = Parser::serialize(elem) {
+                        out.push_str(&format!("{}\r\n", serialized));
+                    } else {
+                        return None;
+                    }
+                    count += 1;
+                }
+                out.insert_str(0, &format!("*{count}\r\n"));
+
+                Some(out)
+            }
         }
     }
 }
@@ -47,39 +91,48 @@ mod tests {
     fn deserialize_simple_string() {
         let test = String::from("+hello world\r\n");
         let parsed = Parser::deserialize(&test);
-        assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap(), RespType::SimpStr(String::from("hello world")));
+        assert_eq!(parsed, Some(Resp::SimpStr(String::from("hello world"))));
     }
 
     #[test]
     fn deserialize_error() {
         let test = String::from("-ERR test error\r\n");
         let parsed = Parser::deserialize(&test);
-        assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap(), RespType::Err(String::from("ERR test error")));
+        assert_eq!(parsed, Some(Resp::Err(String::from("ERR test error"))));
     }
 
     #[test]
     fn deserialize_int() {
         let test = String::from(":75\r\n");
         let parsed = Parser::deserialize(&test);
-        assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap(), RespType::Int(75));
+        assert_eq!(parsed, Some(Resp::Int(75)));
     }
 
     #[test]
     fn deserialize_bulk_string() {
-        let test = String::from("$0\r\n1\r\n");
+        let test = String::from("$12\r\n1\r\nanother\r\n");
         let parsed = Parser::deserialize(&test);
-        assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap(), RespType::BulkStr(String::from("0\r\n1")));
+        assert_eq!(parsed, Some(Resp::BulkStr(String::from("1\r\nanother\r\n"))));
     }
 
     #[test]
     fn deserialize_array() {
         let test = String::from("*2\r\n+hello\r\n:7\r\n");
         let parsed = Parser::deserialize(&test);
-        assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap(), RespType::Arr(vec![RespType::SimpStr(String::from("hello")), RespType::Int(7)]));
+        assert_eq!(parsed, Some(Resp::Arr(vec![Resp::SimpStr(String::from("hello")), Resp::Int(7)])));
+    }
+
+    #[test]
+    fn serialize_simple_string() {
+        let test = Resp::SimpStr(String::from("hello!"));
+        let parsed = Parser::serialize(test);
+        assert_eq!(parsed, Some(String::from("+hello!\r\n")));
+    }
+
+    #[test]
+    fn serialize_error() {
+        let test = Resp::Err(String::from("Bad error"));
+        let parsed = Parser::serialize(test);
+        assert_eq!(parsed, Some(String::from("-Bad error\r\n")));
     }
 }
